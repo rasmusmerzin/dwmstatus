@@ -1,0 +1,183 @@
+#!/bin/bash
+
+DIV='   '
+
+get_top() {
+  awk '
+    { sum[$1] += $2 }
+    END {
+      for (p in sum) {
+        if (sum[p] > top) {
+          top = sum[p]
+          topname = p
+        }
+      }
+      print topname
+    }
+  '
+}
+
+I_NET_UP=""
+I_NET_DOWN=""
+I_WIFI=""
+I_MEMORY=""
+I_CPU=""
+I_BRIGHTNESS=""
+I_BATTERY=""
+I_BATTERY_CHARGING=""
+I_KEYBOARD=""
+I_TRANSMISSION_UP=""
+I_TRANSMISSION_DOWN=""
+I_TRANSMISSION_BOTH=""
+I_TRANSMISSION_IDLE=""
+
+top_mem() {
+  ps axo comm,pmem | get_top
+}
+
+allocated_memory_mebi() {
+  free -m | awk '/^Mem:/{print $2-$7}'
+}
+
+net_up() {
+  local_up=$(cat /sys/class/net/lo/statistics/tx_bytes)
+  echo "$(($(cat /sys/class/net/*/statistics/tx_bytes | paste -sd '+')-local_up))"
+}
+
+net_down() {
+  local_down=$(cat /sys/class/net/lo/statistics/rx_bytes)
+  echo "$(($(cat /sys/class/net/*/statistics/rx_bytes | paste -sd '+')-local_down))"
+}
+
+
+stat_datetime() {
+  datetime=$(date +"%R %F")
+}
+
+stat_memory() {
+  memory="$I_MEMORY $(allocated_memory_mebi)M $(top_mem)"
+}
+
+stat_traffic() {
+  net_up=$(net_up)
+  net_down=$(net_down)
+
+  if [ -n "$net_last_up" ]
+  then net_delta_up=$(((net_up-net_last_up) /1024))
+  else net_delta_up=0
+  fi
+  if [ -n "$net_last_down" ]
+  then net_delta_down=$(((net_down-net_last_down) /1024))
+  else net_delta_down=0
+  fi
+
+  net_last_up=$net_up
+  net_last_down=$net_down
+
+  traffic="$I_NET_UP ${net_delta_up}K $I_NET_DOWN ${net_delta_down}K"
+}
+
+stat_essid() {
+  essid=$(iwgetid --raw 2>/dev/null | while read -r id
+    do echo "$I_WIFI $id"
+    done | paste -sd' '
+  )
+}
+
+stat_transmission() {
+  transmission=$(transmission-remote -l 2>/dev/null | awk '
+    BEGIN {
+      up = 0
+      both = 0
+      down = 0
+      idle = 0
+    }
+    /^\s*[0-9]+\s/ {
+      switch ($0) {
+        case /Downloading/:
+          down++
+          break
+        case /Seeding|Uploading/:
+          up++
+          break
+        case /Up & Down/:
+          both++
+          break
+        default:
+          idle++
+      }
+    }
+    END {
+      if (NR > 0) print "'"$I_TRANSMISSION_UP"' "up, "'"$I_TRANSMISSION_BOTH"' "both, "'"$I_TRANSMISSION_DOWN"' "down, "'"$I_TRANSMISSION_IDLE"' "idle
+    }
+  ')
+}
+
+stat_battery() {
+  battery=$(find /sys/class/power_supply/BAT* -maxdepth 0 2>/dev/null | while read -r bat
+    do
+      charge=$(( $(cat "$bat/charge_now") *100 /$(cat "$bat/charge_full") ))
+      if [ "$(cat "$bat/status")" = "Charging" ]
+      then echo "$I_BATTERY_CHARGING $charge%"
+      else echo "$I_BATTERY $charge%"
+      fi
+    done | paste -sd' '
+  )
+}
+
+stat_backlight() {
+  backlight=$(find /sys/class/backlight/* -maxdepth 0 2>/dev/null | while read -r light
+    do
+      level=$(( $(cat "$light/brightness") *100 /$(cat "$light/max_brightness") ))
+      echo "$I_BRIGHTNESS $level%"
+    done | paste -sd' '
+  )
+}
+
+stat_xkbmap() {
+  xkbmap=$(setxkbmap -query 2>/dev/null | awk '/^layout:/{print toupper($2)}')
+  [ -n "$xkbmap" ] && xkbmap="$I_KEYBOARD $xkbmap"
+}
+
+stat_thermals() {
+  thermals=
+  for temp in $(sensors 2>/dev/null | awk '/^Core/{print substr($3,1,length($3)-4)}')
+  do
+    [ -n "$thermals" ] && thermals=" $thermals"
+    thermals="$temp°C$thermals"
+  done
+  [ -n "$thermals" ] && thermals="$I_CPU $thermals"
+}
+
+status() {
+  stat_xkbmap
+  stat_datetime
+
+  [ $((i%10)) = 0 ] && stat_backlight
+  [ $((i%10)) = 0 ] && stat_traffic
+
+  [ $((i%20)) = 0 ] && stat_battery
+  [ $((i%20)) = 0 ] && stat_essid
+  [ $((i%20)) = 0 ] && stat_memory
+  [ $((i%20)) = 0 ] && stat_thermals
+  [ $((i%20)) = 0 ] && stat_transmission
+
+  result=$datetime
+  for block in "$xkbmap" "$battery" "$backlight" "$thermals" "$memory" "$essid" "$transmission" "$traffic"
+  do [ -n "$block" ] && result="$block$DIV$result"
+  done
+
+  xsetroot -name " $result "
+}
+
+
+main() {
+  i=0
+  while
+    status
+    i=$(((i+1)%36000))
+  do sleep .1
+  done
+}
+
+main 2>> "/tmp/dwmstatus$(date +"%F%R" | tr -d ':' | tr -d '-').log"
